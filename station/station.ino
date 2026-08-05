@@ -1,5 +1,9 @@
-// Backyard Environmental Station v2: all I2C sensors
+// Backyard Environmental Station v3: sensors + Adafruit IO
 // Board: ESP32-S3 Dev Module, USB CDC On Boot enabled
+#define IO_USERNAME "YOUR_AIO_USERNAME"
+#define IO_KEY      "YOUR_AIO_KEY"
+#define WIFI_SSID   "YOUR_WIFI_NAME"
+#define WIFI_PASS   "YOUR_WIFI_PASSWORD"
 
 #include <Wire.h>
 #include <Adafruit_SHT31.h>
@@ -7,6 +11,16 @@
 #include <Adafruit_BMP3XX.h>
 #include <Adafruit_LTR390.h>
 #include <SensirionI2CScd4x.h>
+#include "AdafruitIO_WiFi.h"
+
+AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
+
+AdafruitIO_Feed *fTemp = io.feed("temperature");
+AdafruitIO_Feed *fHum  = io.feed("humidity");
+AdafruitIO_Feed *fLux  = io.feed("light");
+AdafruitIO_Feed *fPres = io.feed("pressure");
+AdafruitIO_Feed *fUv   = io.feed("uv");
+AdafruitIO_Feed *fCo2  = io.feed("co2");
 
 Adafruit_SHT31 sht = Adafruit_SHT31();
 BH1750 lightMeter;
@@ -16,6 +30,8 @@ SensirionI2CScd4x scd4x;
 
 bool haveSht, haveBmp, haveLtr, haveScd;
 uint16_t co2 = 0;
+unsigned long lastPublish = 0;
+const unsigned long PUBLISH_MS = 30000;  // free tier: 30 points/min
 
 void setup() {
   Serial.begin(115200);
@@ -40,38 +56,51 @@ void setup() {
   delay(500);
   haveScd = (scd4x.startPeriodicMeasurement() == 0);
 
-  Serial.println("=== Station v2 ===");
-  Serial.print("SHT31:");  Serial.println(haveSht ? "OK" : "MISSING");
-  Serial.print("BMP388:"); Serial.println(haveBmp ? "OK" : "MISSING");
-  Serial.print("LTR390:"); Serial.println(haveLtr ? "OK" : "MISSING");
-  Serial.print("SCD41:");  Serial.println(haveScd ? "OK" : "MISSING");
+  Serial.print("Connecting to Adafruit IO");
+  io.connect();
+  while (io.status() < AIO_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.println(io.statusText());
 }
 
 void loop() {
-  float t = haveSht ? sht.readTemperature() : 0;
-  float h = haveSht ? sht.readHumidity()    : 0;
-  float lux = lightMeter.readLightLevel();
-
-  float pres = 0;
-  if (haveBmp && bmp.performReading()) pres = bmp.pressure / 100.0;
-
-  uint32_t uv = 0;
-  if (haveLtr && ltr.newDataAvailable()) uv = ltr.readUVS();
+  io.run();
 
   if (haveScd) {
     bool ready = false;
     if (scd4x.getDataReadyFlag(ready) == 0 && ready) {
-      uint16_t c; float st, sh;
-      if (scd4x.readMeasurement(c, st, sh) == 0 && c > 0) co2 = c;
+      uint16_t c; float st, shm;
+      if (scd4x.readMeasurement(c, st, shm) == 0 && c > 0) co2 = c;
     }
   }
 
-  Serial.print("TempC:");     Serial.print(t);
-  Serial.print(",Humidity:"); Serial.print(h);
-  Serial.print(",Lux/100:");  Serial.print(lux / 100.0);
-  Serial.print(",hPa-950:");  Serial.print(pres > 0 ? pres - 950.0 : 0);
-  Serial.print(",UVraw/50:"); Serial.print(uv / 50.0);
-  Serial.print(",CO2/50:");   Serial.println(co2 / 50.0);
+  if (millis() - lastPublish >= PUBLISH_MS) {
+    lastPublish = millis();
 
-  delay(1000);
+    float t = haveSht ? sht.readTemperature() : NAN;
+    float h = haveSht ? sht.readHumidity()    : NAN;
+    float lux = lightMeter.readLightLevel();
+    float pres = NAN;
+    if (haveBmp && bmp.performReading()) pres = bmp.pressure / 100.0;
+    uint32_t uv = 0;
+    if (haveLtr && ltr.newDataAvailable()) uv = ltr.readUVS();
+
+    if (!isnan(t))    fTemp->save(t);
+    if (!isnan(h))    fHum->save(h);
+    fLux->save(lux);
+    if (!isnan(pres)) fPres->save(pres);
+    fUv->save((int)uv);
+    if (co2 > 0)      fCo2->save(co2);
+
+    Serial.print("Published: ");
+    Serial.print(t); Serial.print("C ");
+    Serial.print(h); Serial.print("% ");
+    Serial.print(lux); Serial.print("lx ");
+    Serial.print(pres); Serial.print("hPa uv=");
+    Serial.print(uv); Serial.print(" co2=");
+    Serial.println(co2);
+  }
 }
