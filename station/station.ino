@@ -11,6 +11,7 @@
 #include <Adafruit_BMP3XX.h>
 #include <Adafruit_LTR390.h>
 #include <SensirionI2CScd4x.h>
+#include <Adafruit_PM25AQI.h>
 #include "AdafruitIO_WiFi.h"
 
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
@@ -21,12 +22,17 @@ AdafruitIO_Feed *fLux  = io.feed("light");
 AdafruitIO_Feed *fPres = io.feed("pressure");
 AdafruitIO_Feed *fUv   = io.feed("uv");
 AdafruitIO_Feed *fCo2  = io.feed("co2");
+AdafruitIO_Feed *fPm1  = io.feed("pm1");
+AdafruitIO_Feed *fPm25 = io.feed("pm25");
+AdafruitIO_Feed *fPm10 = io.feed("pm10");
 
 Adafruit_SHT31 sht = Adafruit_SHT31();
 BH1750 lightMeter;
 Adafruit_BMP3XX bmp;
 Adafruit_LTR390 ltr = Adafruit_LTR390();
 SensirionI2CScd4x scd4x;
+Adafruit_PM25AQI aqi = Adafruit_PM25AQI();
+bool havePm = false;
 
 bool haveSht, haveBmp, haveLtr, haveScd;
 uint16_t co2 = 0;
@@ -51,6 +57,12 @@ void setup() {
     ltr.setGain(LTR390_GAIN_3);
     ltr.setResolution(LTR390_RESOLUTION_18BIT);
   }
+  // PMS5003 on UART1: sensor TX -> GPIO18, sensor RX -> GPIO17
+  Serial1.begin(9600, SERIAL_8N1, 18, 17);
+  delay(1000);
+  havePm = aqi.begin_UART(&Serial1);
+  Serial.print("PMS5003:"); Serial.println(havePm ? "OK" : "MISSING");
+
   scd4x.begin(Wire);
   scd4x.stopPeriodicMeasurement();
   delay(500);
@@ -94,6 +106,14 @@ void loop() {
     if (!isnan(pres)) fPres->save(pres);
     fUv->save((int)uv);
     if (co2 > 0)      fCo2->save(co2);
+
+    PM25_AQI_Data pm;
+    if (havePm && aqi.read(&pm)) {
+      fPm1->save(pm.pm10_standard);    // PM1.0
+      fPm25->save(pm.pm25_standard);   // PM2.5
+      fPm10->save(pm.pm100_standard);  // PM10
+      Serial.print("PM2.5="); Serial.println(pm.pm25_standard);
+    }
 
     Serial.print("Published: ");
     Serial.print(t); Serial.print("C ");
