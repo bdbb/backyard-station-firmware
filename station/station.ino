@@ -1,5 +1,6 @@
-// Backyard Environmental Station v3: sensors + Adafruit IO
-// Board: ESP32-S3 Dev Module, USB CDC On Boot enabled
+// Backyard Environmental Station v4: PMS5003
+// Board: ESP32-S3 Dev Module, USB CDC On Boot enabled, PSRAM OPI
+// read every pass: the PMS5003 streams, slow reads go stale
 #define IO_USERNAME "YOUR_AIO_USERNAME"
 #define IO_KEY      "YOUR_AIO_KEY"
 #define WIFI_SSID   "YOUR_WIFI_NAME"
@@ -33,6 +34,8 @@ Adafruit_LTR390 ltr = Adafruit_LTR390();
 SensirionI2CScd4x scd4x;
 Adafruit_PM25AQI aqi = Adafruit_PM25AQI();
 bool havePm = false;
+PM25_AQI_Data lastPm;
+bool pmFresh = false;
 
 bool haveSht, haveBmp, haveLtr, haveScd;
 uint16_t co2 = 0;
@@ -80,7 +83,8 @@ void setup() {
 
 void loop() {
   io.run();
-
+  PM25_AQI_Data d;
+  if (havePm && aqi.read(&d)) { lastPm = d; pmFresh = true; }
   if (haveScd) {
     bool ready = false;
     if (scd4x.getDataReadyFlag(ready) == 0 && ready) {
@@ -104,15 +108,14 @@ void loop() {
     if (!isnan(h))    fHum->save(h);
     fLux->save(lux);
     if (!isnan(pres)) fPres->save(pres);
-    fUv->save((int)uv);
+    fUv->save(uv / 96.0);   // ≈ UV index at gain 3, 18-bit
     if (co2 > 0)      fCo2->save(co2);
 
-    PM25_AQI_Data pm;
-    if (havePm && aqi.read(&pm)) {
-      fPm1->save(pm.pm10_standard);    // PM1.0
-      fPm25->save(pm.pm25_standard);   // PM2.5
-      fPm10->save(pm.pm100_standard);  // PM10
-      Serial.print("PM2.5="); Serial.println(pm.pm25_standard);
+    if (pmFresh) {
+      fPm1->save(lastPm.pm10_standard);
+      fPm25->save(lastPm.pm25_standard);
+      fPm10->save(lastPm.pm100_standard);
+      Serial.print("PM2.5="); Serial.println(lastPm.pm25_standard);
     }
 
     Serial.print("Published: ");
