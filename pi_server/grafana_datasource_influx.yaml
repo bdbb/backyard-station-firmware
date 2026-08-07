@@ -1,0 +1,13 @@
+# /etc/grafana/provisioning/datasources/influx.yaml
+apiVersion: 1
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    access: proxy
+    url: http://127.0.0.1:8086
+    jsonData:
+      version: Flux
+      organization: envstation
+      defaultBucket: sensors
+    secureJsonData:
+      token: YOUR_INFLUXDB_TOKEN

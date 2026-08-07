@@ -1,6 +1,5 @@
-// Backyard Environmental Station v4: PMS5003
-// Board: ESP32-S3 Dev Module, USB CDC On Boot enabled, PSRAM OPI
-// read every pass: the PMS5003 streams, slow reads go stale
+// Backyard Environmental Station v3: sensors + Adafruit IO
+// Board: ESP32-S3 Dev Module, USB CDC On Boot enabled
 #define IO_USERNAME "YOUR_AIO_USERNAME"
 #define IO_KEY      "YOUR_AIO_KEY"
 #define WIFI_SSID   "YOUR_WIFI_NAME"
@@ -14,6 +13,14 @@
 #include <SensirionI2CScd4x.h>
 #include <Adafruit_PM25AQI.h>
 #include "AdafruitIO_WiFi.h"
+#include <PubSubClient.h>
+
+#define PI_MQTT_HOST "192.168.1.106"
+#define PI_MQTT_PORT 1883
+WiFiClient piNet;
+PubSubClient piMqtt(piNet);
+unsigned long lastPiPublish = 0;
+const unsigned long PI_PUBLISH_MS = 10000;
 
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
 
@@ -79,12 +86,45 @@ void setup() {
   }
   Serial.println();
   Serial.println(io.statusText());
+
+  piMqtt.setServer(PI_MQTT_HOST, PI_MQTT_PORT);
+}
+
+void publishToPi() {
+  if (!piMqtt.connected()) {
+    if (!piMqtt.connect("esp32-station")) return;
+  }
+  float t = haveSht ? sht.readTemperature() : NAN;
+  float h = haveSht ? sht.readHumidity()    : NAN;
+  float lux = lightMeter.readLightLevel();
+  float pres = NAN;
+  if (haveBmp && bmp.performReading()) pres = bmp.pressure / 100.0;
+  uint32_t uv = 0;
+  if (haveLtr && ltr.newDataAvailable()) uv = ltr.readUVS();
+
+  char msg[320];
+  snprintf(msg, sizeof(msg),
+    "{\"tempC\":%.2f,\"humidity\":%.2f,\"lux\":%.1f,\"pressure_hpa\":%.2f,"
+    "\"uv_index\":%.2f,\"co2_ppm\":%u,\"pm1\":%u,\"pm25\":%u,\"pm10\":%u}",
+    t, h, lux, pres, uv / 96.0, co2,
+    pmFresh ? lastPm.pm10_standard : 0,
+    pmFresh ? lastPm.pm25_standard : 0,
+    pmFresh ? lastPm.pm100_standard : 0);
+  piMqtt.publish("station/env", msg);
 }
 
 void loop() {
   io.run();
+  piMqtt.loop();
+
   PM25_AQI_Data d;
   if (havePm && aqi.read(&d)) { lastPm = d; pmFresh = true; }
+
+  if (millis() - lastPiPublish >= PI_PUBLISH_MS) {
+    lastPiPublish = millis();
+    publishToPi();
+  }
+
   if (haveScd) {
     bool ready = false;
     if (scd4x.getDataReadyFlag(ready) == 0 && ready) {
@@ -108,13 +148,13 @@ void loop() {
     if (!isnan(h))    fHum->save(h);
     fLux->save(lux);
     if (!isnan(pres)) fPres->save(pres);
-    fUv->save(uv / 96.0);   // ≈ UV index at gain 3, 18-bit
+    fUv->save((int)uv);
     if (co2 > 0)      fCo2->save(co2);
 
     if (pmFresh) {
-      fPm1->save(lastPm.pm10_standard);
-      fPm25->save(lastPm.pm25_standard);
-      fPm10->save(lastPm.pm100_standard);
+      fPm1->save(lastPm.pm10_standard);    // PM1.0
+      fPm25->save(lastPm.pm25_standard);   // PM2.5
+      fPm10->save(lastPm.pm100_standard);  // PM10
       Serial.print("PM2.5="); Serial.println(lastPm.pm25_standard);
     }
 
