@@ -15,7 +15,7 @@
 #include "AdafruitIO_WiFi.h"
 #include <PubSubClient.h>
 
-#define PI_MQTT_HOST "192.168.1.106"
+#define PI_MQTT_HOST "192.168.1.105"
 #define PI_MQTT_PORT 1883
 WiFiClient piNet;
 PubSubClient piMqtt(piNet);
