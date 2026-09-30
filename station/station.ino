@@ -13,13 +13,13 @@
 #include <SensirionI2CScd4x.h>
 #include <Adafruit_PM25AQI.h>
 #include "AdafruitIO_WiFi.h"
-#include <PubSubClient.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
 
-#define PI_MQTT_HOST "192.168.1.105"
-#define PI_MQTT_PORT 1883
-WiFiClient piNet;
-PubSubClient piMqtt(piNet);
-unsigned long lastPiPublish = 0;
+#define ENVI_URL     "https://envi.myrondomain.com/api/ingest"
+#define ENVI_SECRET  "YOUR_INGEST_SECRET"
+unsigned long lastEnviPublish = 0;
 
 #define PIN_ANEMOMETER 15
 #define PIN_VANE        9   // 10k pull-up to 3V3
@@ -51,7 +51,7 @@ float readWindDir() {
   }
   return VANE_DEG[best];
 }
-const unsigned long PI_PUBLISH_MS = 10000;
+const unsigned long ENVI_PUBLISH_MS = 10000;
 
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
 
@@ -118,8 +118,7 @@ void setup() {
   Serial.println();
   Serial.println(io.statusText());
 
-  piMqtt.setServer(PI_MQTT_HOST, PI_MQTT_PORT);
-  piMqtt.setBufferSize(512);
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
 
   pinMode(PIN_ANEMOMETER, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ANEMOMETER), onWindPulse, FALLING);
@@ -129,10 +128,9 @@ void setup() {
   gustWindowStart = millis();
 }
 
-void publishToPi() {
-  if (!piMqtt.connected()) {
-    if (!piMqtt.connect("esp32-station")) return;
-  }
+void publishToEnvi() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return;   // clock not synced yet
   float t = haveSht ? sht.readTemperature() : NAN;
   float h = haveSht ? sht.readHumidity()    : NAN;
   float lux = lightMeter.readLightLevel();
@@ -147,8 +145,8 @@ void publishToPi() {
   float windKmh = secs > 0 ? (pulses - lastPulses) / secs * 2.4 : 0;
   lastPulses = pulses; lastWindMs = millis();
 
-  char msg[480];
-  snprintf(msg, sizeof(msg),
+  char fields[480];
+  snprintf(fields, sizeof(fields),
     "{\"tempC\":%.2f,\"humidity\":%.2f,\"lux\":%.1f,\"pressure_hpa\":%.2f,"
     "\"uv_index\":%.2f,\"co2_ppm\":%u,\"pm1\":%u,\"pm25\":%u,\"pm10\":%u,"
     "\"wind_kmh\":%.1f,\"wind_gust_kmh\":%.1f,\"wind_dir_deg\":%.1f,\"rain_tips\":%u,\"rain_mm\":%.2f}",
@@ -157,13 +155,26 @@ void publishToPi() {
     pmFresh ? lastPm.pm25_standard : 0,
     pmFresh ? lastPm.pm100_standard : 0,
     windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794);
-  piMqtt.publish("station/env", msg);
+  char body[640];
+  snprintf(body, sizeof(body),
+    "{\"metrics\":[{\"name\":\"env\",\"fields\":%s,\"tags\":{\"host\":\"esp32\"},\"timestamp\":%ld}]}",
+    fields, (long)now);
+
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+  if (http.begin(tls, ENVI_URL)) {
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " ENVI_SECRET);
+    int code = http.POST((uint8_t*)body, strlen(body));
+    Serial.print("envi POST -> "); Serial.println(code);
+    http.end();
+  }
   gustKmh = 0;
 }
 
 void loop() {
   io.run();
-  piMqtt.loop();
 
   PM25_AQI_Data d;
   if (havePm && aqi.read(&d)) { lastPm = d; pmFresh = true; }
@@ -175,9 +186,9 @@ void loop() {
     gustPulses = p; gustWindowStart = millis();
   }
 
-  if (millis() - lastPiPublish >= PI_PUBLISH_MS) {
-    lastPiPublish = millis();
-    publishToPi();
+  if (millis() - lastEnviPublish >= ENVI_PUBLISH_MS) {
+    lastEnviPublish = millis();
+    publishToEnvi();
   }
 
   if (haveScd) {
