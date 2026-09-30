@@ -20,6 +20,37 @@
 WiFiClient piNet;
 PubSubClient piMqtt(piNet);
 unsigned long lastPiPublish = 0;
+
+#define PIN_ANEMOMETER 15
+#define PIN_VANE        9   // 10k pull-up to 3V3
+#define PIN_RAIN       16
+volatile uint32_t windPulses = 0, rainTips = 0;
+volatile unsigned long lastWindUs = 0, lastRainMs = 0;
+uint32_t gustPulses = 0; unsigned long gustWindowStart = 0; float gustKmh = 0;
+
+void IRAM_ATTR onWindPulse() {
+  unsigned long now = micros();
+  if (now - lastWindUs > 5000) { windPulses++; lastWindUs = now; }   // 5 ms debounce
+}
+void IRAM_ATTR onRainTip() {
+  unsigned long now = millis();
+  if (now - lastRainMs > 100) { rainTips++; lastRainMs = now; }
+}
+
+// vane resistance (ohms, SparkFun datasheet) -> degrees
+const float VANE_R[16]   = {33000,6570,8200,891,1000,688,2200,1410,3900,3140,16000,14120,120000,42120,64900,21880};
+const float VANE_DEG[16] = {0,22.5,45,67.5,90,112.5,135,157.5,180,202.5,225,247.5,270,292.5,315,337.5};
+float readWindDir() {
+  float v = analogReadMilliVolts(PIN_VANE) / 1000.0;
+  if (v >= 3.25 || v <= 0.02) return -1;          // unplugged / shorted
+  float r = 10000.0 * v / (3.3 - v);
+  int best = 0; float bestErr = 1e9;
+  for (int i = 0; i < 16; i++) {
+    float e = fabs(log(r) - log(VANE_R[i]));
+    if (e < bestErr) { bestErr = e; best = i; }
+  }
+  return VANE_DEG[best];
+}
 const unsigned long PI_PUBLISH_MS = 10000;
 
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
@@ -88,6 +119,14 @@ void setup() {
   Serial.println(io.statusText());
 
   piMqtt.setServer(PI_MQTT_HOST, PI_MQTT_PORT);
+  piMqtt.setBufferSize(512);
+
+  pinMode(PIN_ANEMOMETER, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_ANEMOMETER), onWindPulse, FALLING);
+  pinMode(PIN_RAIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_RAIN), onRainTip, FALLING);
+  analogSetPinAttenuation(PIN_VANE, ADC_11db);
+  gustWindowStart = millis();
 }
 
 void publishToPi() {
@@ -102,15 +141,24 @@ void publishToPi() {
   uint32_t uv = 0;
   if (haveLtr && ltr.newDataAvailable()) uv = ltr.readUVS();
 
-  char msg[320];
+  static uint32_t lastPulses = 0; static unsigned long lastWindMs = 0;
+  noInterrupts(); uint32_t pulses = windPulses; uint32_t rainTotal = rainTips; interrupts();
+  float secs = lastWindMs ? (millis() - lastWindMs) / 1000.0 : 0;
+  float windKmh = secs > 0 ? (pulses - lastPulses) / secs * 2.4 : 0;
+  lastPulses = pulses; lastWindMs = millis();
+
+  char msg[480];
   snprintf(msg, sizeof(msg),
     "{\"tempC\":%.2f,\"humidity\":%.2f,\"lux\":%.1f,\"pressure_hpa\":%.2f,"
-    "\"uv_index\":%.2f,\"co2_ppm\":%u,\"pm1\":%u,\"pm25\":%u,\"pm10\":%u}",
+    "\"uv_index\":%.2f,\"co2_ppm\":%u,\"pm1\":%u,\"pm25\":%u,\"pm10\":%u,"
+    "\"wind_kmh\":%.1f,\"wind_gust_kmh\":%.1f,\"wind_dir_deg\":%.1f,\"rain_tips\":%u,\"rain_mm\":%.2f}",
     t, h, lux, pres, uv / 96.0, co2,
     pmFresh ? lastPm.pm10_standard : 0,
     pmFresh ? lastPm.pm25_standard : 0,
-    pmFresh ? lastPm.pm100_standard : 0);
+    pmFresh ? lastPm.pm100_standard : 0,
+    windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794);
   piMqtt.publish("station/env", msg);
+  gustKmh = 0;
 }
 
 void loop() {
@@ -119,6 +167,13 @@ void loop() {
 
   PM25_AQI_Data d;
   if (havePm && aqi.read(&d)) { lastPm = d; pmFresh = true; }
+
+  if (millis() - gustWindowStart >= 3000) {      // gust = max 3 s average (WMO)
+    noInterrupts(); uint32_t p = windPulses; interrupts();
+    float k = (p - gustPulses) / 3.0 * 2.4;      // 1 pulse/s = 2.4 km/h
+    if (k > gustKmh) gustKmh = k;
+    gustPulses = p; gustWindowStart = millis();
+  }
 
   if (millis() - lastPiPublish >= PI_PUBLISH_MS) {
     lastPiPublish = millis();
