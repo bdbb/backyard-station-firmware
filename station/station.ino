@@ -1,4 +1,4 @@
-// Backyard Environmental Station v3: sensors + Adafruit IO
+// Backyard Environmental Station v8: sensors, wind, rain -> envi + Adafruit IO
 // Board: ESP32-S3 Dev Module, USB CDC On Boot enabled
 #define IO_USERNAME "YOUR_AIO_USERNAME"
 #define IO_KEY      "YOUR_AIO_KEY"
@@ -15,6 +15,11 @@
 #include "AdafruitIO_WiFi.h"
 #include <WiFiClientSecure.h>
 #include <time.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+WebServer web(80);
+char lastFields[480] = "{}";
 
 #define ENVI_HOST    "envi.myrondomain.com"
 #define ENVI_PATH    "/api/ingest"
@@ -80,6 +85,47 @@ uint16_t co2 = 0;
 unsigned long lastPublish = 0;
 const unsigned long PUBLISH_MS = 30000;  // free tier: 30 points/min
 
+const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>Station live</title>
+<style>body{margin:0;background:#0b0f14;color:#dbe7f3;font:15px system-ui,sans-serif;padding:16px}
+h1{font-size:18px;margin:0 0 12px}.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.c{background:#111820;border:1px solid #1e2a36;border-radius:12px;padding:12px}.l{color:#7d93a8;font-size:12px}
+.v{font-size:26px;font-weight:600;margin-top:4px}.u{font-size:13px;color:#7d93a8}
+#cmp{width:150px;height:150px;border-radius:50%;border:2px solid #2dd4bf;position:relative;margin:auto}
+#ndl{position:absolute;left:73px;top:10px;width:4px;height:65px;background:#2dd4bf;transform-origin:2px 65px;border-radius:2px;transition:transform .3s}
+.n{position:absolute;font-size:12px;color:#7d93a8}#s{color:#7d93a8;font-size:12px;margin-top:12px}</style></head><body>
+<h1>Backyard station &middot; live test view</h1>
+<div class=g>
+<div class=c style="grid-row:span 2;text-align:center"><div class=l>Wind direction (live)</div><br>
+<div id=cmp><span class=n style="left:70px;top:2px">N</span><span class=n style="right:4px;top:66px">E</span><span class=n style="left:71px;bottom:2px">S</span><span class=n style="left:4px;top:66px">W</span><div id=ndl></div></div>
+<div class=v id=dir>-</div></div>
+<div class=c><div class=l>Anemometer clicks (live)</div><div class=v id=pul>-</div></div>
+<div class=c><div class=l>Wind speed (10 s avg)</div><div class=v><span id=wk>-</span> <span class=u>km/h</span></div></div>
+<div class=c><div class=l>Gust</div><div class=v><span id=wg>-</span> <span class=u>km/h</span></div></div>
+<div class=c><div class=l>Rain tips (live)</div><div class=v id=rt>-</div></div>
+<div class=c><div class=l>Temperature</div><div class=v><span id=t>-</span> <span class=u>&deg;C</span></div></div>
+<div class=c><div class=l>Humidity</div><div class=v><span id=h>-</span> <span class=u>%</span></div></div>
+<div class=c><div class=l>CO&#8322;</div><div class=v><span id=co>-</span> <span class=u>ppm</span></div></div>
+<div class=c><div class=l>PM2.5</div><div class=v><span id=pm>-</span> <span class=u>&micro;g/m&sup3;</span></div></div>
+<div class=c><div class=l>Pressure</div><div class=v><span id=p>-</span> <span class=u>hPa</span></div></div>
+<div class=c><div class=l>Light</div><div class=v><span id=lx>-</span> <span class=u>lux</span></div></div>
+</div><div id=s>connecting...</div>
+<script>const $=i=>document.getElementById(i),f=(v,d=1)=>v==null?'-':(+v).toFixed(d);
+async function tick(){try{const r=await(await fetch('/data')).json(),L=r.live,A=r.last;
+const d=L.wind_dir_deg;$('dir').textContent=d<0?'vane not connected':d+'°';if(d>=0)$('ndl').style.transform='rotate('+d+'deg)';
+$('pul').textContent=L.wind_pulses;$('rt').textContent=L.rain_tips;
+$('wk').textContent=f(A.wind_kmh);$('wg').textContent=f(A.wind_gust_kmh);$('t').textContent=f(A.tempC);$('h').textContent=f(A.humidity);
+$('co').textContent=A.co2_ppm?A.co2_ppm:'-';$('pm').textContent=f(A.pm25,0);$('p').textContent=f(A.pressure_hpa);$('lx').textContent=f(A.lux,0);
+$('s').textContent='updated '+new Date().toLocaleTimeString()}catch(e){$('s').textContent='lost connection to station'}}
+setInterval(tick,1000);tick();</script></body></html>)HTML";
+
+void handleData() {
+  noInterrupts(); uint32_t p = windPulses, r = rainTips; interrupts();
+  char out[700];
+  snprintf(out, sizeof(out), "{\"live\":{\"wind_dir_deg\":%.1f,\"wind_pulses\":%u,\"rain_tips\":%u},\"last\":%s}",
+           readWindDir(), p, r, lastFields);
+  web.send(200, "application/json", out);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2000);
@@ -117,6 +163,13 @@ void setup() {
   }
   Serial.println();
   Serial.println(io.statusText());
+
+  MDNS.begin("station");
+  web.on("/", [](){ web.send_P(200, "text/html; charset=utf-8", PAGE); });
+  web.on("/data", handleData);
+  web.begin();
+  Serial.print("Live test page: http://station.local  or  http://");
+  Serial.println(WiFi.localIP());
 
   configTime(0, 0, "pool.ntp.org", "time.google.com");
 
@@ -156,6 +209,7 @@ void publishToEnvi() {
     pmFresh ? lastPm.pm100_standard : 0,
     windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794);
   Serial.println(fields);
+  strncpy(lastFields, fields, sizeof(lastFields) - 1);
   char body[640];
   snprintf(body, sizeof(body),
     "{\"metrics\":[{\"name\":\"env\",\"fields\":%s,\"tags\":{\"host\":\"esp32\"},\"timestamp\":%ld}]}",
@@ -183,6 +237,7 @@ void publishToEnvi() {
 }
 
 void loop() {
+  web.handleClient();
   io.run();
 
   PM25_AQI_Data d;
