@@ -13,11 +13,11 @@
 #include <SensirionI2CScd4x.h>
 #include <Adafruit_PM25AQI.h>
 #include "AdafruitIO_WiFi.h"
-#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
 
-#define ENVI_URL     "https://envi.myrondomain.com/api/ingest"
+#define ENVI_HOST    "envi.myrondomain.com"
+#define ENVI_PATH    "/api/ingest"
 #define ENVI_SECRET  "YOUR_INGEST_SECRET"
 unsigned long lastEnviPublish = 0;
 
@@ -155,20 +155,29 @@ void publishToEnvi() {
     pmFresh ? lastPm.pm25_standard : 0,
     pmFresh ? lastPm.pm100_standard : 0,
     windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794);
+  Serial.println(fields);
   char body[640];
   snprintf(body, sizeof(body),
     "{\"metrics\":[{\"name\":\"env\",\"fields\":%s,\"tags\":{\"host\":\"esp32\"},\"timestamp\":%ld}]}",
     fields, (long)now);
 
+  // raw HTTPS POST: HTTPClient clashes with ArduinoHttpClient on macOS
   WiFiClientSecure tls;
   tls.setInsecure();
-  HTTPClient http;
-  if (http.begin(tls, ENVI_URL)) {
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer " ENVI_SECRET);
-    int code = http.POST((uint8_t*)body, strlen(body));
-    Serial.print("envi POST -> "); Serial.println(code);
-    http.end();
+  if (tls.connect(ENVI_HOST, 443)) {
+    size_t len = strlen(body);
+    tls.print("POST " ENVI_PATH " HTTP/1.1\r\n");
+    tls.print("Host: " ENVI_HOST "\r\n");
+    tls.print("Authorization: Bearer " ENVI_SECRET "\r\n");
+    tls.print("Content-Type: application/json\r\n");
+    tls.print("Content-Length: "); tls.print(len); tls.print("\r\n");
+    tls.print("Connection: close\r\n\r\n");
+    tls.write((const uint8_t*)body, len);
+    String status = tls.readStringUntil('\n');
+    Serial.print("envi POST -> "); Serial.println(status);
+    tls.stop();
+  } else {
+    Serial.println("envi POST -> connect failed");
   }
   gustKmh = 0;
 }
