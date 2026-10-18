@@ -1,7 +1,6 @@
-// Backyard Environmental Station v8: sensors, wind, rain -> envi + Adafruit IO
+// Backyard Environmental Station v8: sensors, wind, rain -> envi
 // Board: ESP32-S3 Dev Module, USB CDC On Boot enabled
 #include "secrets.h"
-#define OTA_PASS    IO_KEY
 
 #include <Wire.h>
 #include <Adafruit_SHT31.h>
@@ -10,7 +9,7 @@
 #include <Adafruit_LTR390.h>
 #include <SensirionI2CScd4x.h>
 #include <Adafruit_PM25AQI.h>
-#include "AdafruitIO_WiFi.h"
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
 #include <WebServer.h>
@@ -57,18 +56,6 @@ float readWindDir() {
 }
 const unsigned long ENVI_PUBLISH_MS = 10000;
 
-AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
-
-AdafruitIO_Feed *fTemp = io.feed("temperature");
-AdafruitIO_Feed *fHum  = io.feed("humidity");
-AdafruitIO_Feed *fLux  = io.feed("light");
-AdafruitIO_Feed *fPres = io.feed("pressure");
-AdafruitIO_Feed *fUv   = io.feed("uv");
-AdafruitIO_Feed *fCo2  = io.feed("co2");
-AdafruitIO_Feed *fPm1  = io.feed("pm1");
-AdafruitIO_Feed *fPm25 = io.feed("pm25");
-AdafruitIO_Feed *fPm10 = io.feed("pm10");
-
 Adafruit_SHT31 sht = Adafruit_SHT31();
 BH1750 lightMeter;
 Adafruit_BMP3XX bmp;
@@ -83,9 +70,6 @@ bool haveSht, haveBmp, haveLtr, haveScd;
 uint16_t co2 = 0;
 float tempC = NAN, humidity = NAN, lux = NAN, presHpa = NAN;
 uint32_t uvRaw = 0; bool uvSeen = false;
-bool aioUp = false;
-unsigned long lastPublish = 0;
-const unsigned long PUBLISH_MS = 30000;  // free tier: 30 points/min
 
 void readSensors() {
   if (haveSht) sht.readBoth(&tempC, &humidity);
@@ -163,7 +147,7 @@ for(const[k,,u,dp,span,sc]of M){let v=d[k];if(k=='gust'){const w=H.wk.filter(x=>
 push(k,v);show(k,v==null?'–':(+v).toFixed(dp));spark(k,span);cmp(k,v,dp,u);
 if(sc){const b=$('b_'+k);b.hidden=v==null;if(v!=null)b.style.insetInlineStart=Math.max(0,Math.min(100,(v-sc[0])/(sc[1]-sc[0])*100))+'%'}
 if(RT[k])$('r_'+k).textContent=v==null?'':RT[k].find(([lim])=>v<=lim)[1]}
-$('ft').textContent=`Vane ${d.vane_mv} mV · cups switch ${d.cups_open?'open':'closed'} · ${d.clicks} wind clicks · ${d.tips} rain tips · Wi-Fi ${d.rssi} dBm · Adafruit IO ${d.aio?'connected':'offline'} · up ${up(d.up)}`}
+$('ft').textContent=`Vane ${d.vane_mv} mV · cups switch ${d.cups_open?'open':'closed'} · ${d.clicks} wind clicks · ${d.tips} rain tips · Wi-Fi ${d.rssi} dBm · up ${up(d.up)}`}
 async function svc(){try{const e=ELEV==null?'':'&elevation='+ELEV,q=`latitude=${LAT}&longitude=${LON}&timezone=auto`;
 const[w,a]=await Promise.all([fetch(`https://api.open-meteo.com/v1/forecast?${q}${e}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m,uv_index&daily=precipitation_sum&forecast_days=1`).then(r=>r.json()),fetch(`https://air-quality-api.open-meteo.com/v1/air-quality?${q}&current=pm2_5,carbon_dioxide`).then(r=>r.json())]);
 const c=w.current,x=a.current;Object.assign(S,{t:c.temperature_2m,h:c.relative_humidity_2m,p:c.surface_pressure,wk:c.wind_speed_10m,wd:c.wind_direction_10m,gust:c.wind_gusts_10m,uv:c.uv_index,rain:w.daily.precipitation_sum[0],pm25:x.pm2_5,co2:x.carbon_dioxide});
@@ -182,8 +166,8 @@ void handleData() {
   noInterrupts(); uint32_t clicks = windPulses, tips = rainTips; interrupts();
   float wd = readWindDir();
   char out[512];
-  int o = snprintf(out, sizeof(out), "{\"clicks\":%u,\"tips\":%u,\"vane_mv\":%u,\"cups_open\":%d,\"rssi\":%d,\"aio\":%d,\"up\":%lu,",
-                   clicks, tips, analogReadMilliVolts(PIN_VANE), digitalRead(PIN_ANEMOMETER), WiFi.RSSI(), aioUp, millis() / 1000);
+  int o = snprintf(out, sizeof(out), "{\"clicks\":%u,\"tips\":%u,\"vane_mv\":%u,\"cups_open\":%d,\"rssi\":%d,\"up\":%lu,",
+                   clicks, tips, analogReadMilliVolts(PIN_VANE), digitalRead(PIN_ANEMOMETER), WiFi.RSSI(), millis() / 1000);
   o += jnum(out + o, sizeof(out) - o, "t", tempC, 2);
   o += jnum(out + o, sizeof(out) - o, "h", humidity, 1);
   o += jnum(out + o, sizeof(out) - o, "p", presHpa, 1);
@@ -204,16 +188,17 @@ void setup() {
   Serial.setTxTimeoutMs(0);       // don't stall when no serial monitor is open
   delay(2000);
   Wire.begin(4, 5);
+  Wire1.begin(10, 11);    // bus 2: light + UV
 
   haveSht = sht.begin(0x44);
-  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
+  bool haveLux = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire1);
   haveBmp = bmp.begin_I2C(0x77, &Wire);
   if (haveBmp) {
     bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
     bmp.performReading();   // first reading after config is garbage
   }
-  haveLtr = ltr.begin(&Wire);
+  haveLtr = ltr.begin(&Wire1);
   if (haveLtr) {
     ltr.setMode(LTR390_MODE_UVS);
     ltr.setGain(LTR390_GAIN_3);
@@ -229,12 +214,13 @@ void setup() {
   scd4x.stopPeriodicMeasurement();
   delay(500);
   haveScd = (scd4x.startPeriodicMeasurement() == 0);
-  Serial.printf("Sensors: sht=%d bmp=%d ltr=%d scd=%d\n", haveSht, haveBmp, haveLtr, haveScd);
+  Serial.printf("Sensors: sht=%d bmp=%d scd=%d | bus 2: light=%d uv=%d\n", haveSht, haveBmp, haveScd, haveLux, haveLtr);
 
   WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
     Serial.printf("Wi-Fi disconnected: %s\n", WiFi.STA.disconnectReasonName((wifi_err_reason_t)info.wifi_sta_disconnected.reason));
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-  io.connect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   ArduinoOTA.setHostname("station");
   ArduinoOTA.setPassword(OTA_PASS);
   web.on("/", [](){ web.send_P(200, "text/html; charset=utf-8", PAGE); });
@@ -325,12 +311,6 @@ void loop() {
     wifiDownSince = millis();
   }
 
-  // io.run() blocks up to 60 s while Adafruit IO is down
-  bool aioNow = wifiUp && io.mqttStatus(true) == AIO_CONNECTED;
-  if (aioNow != aioUp) Serial.println(aioNow ? "Adafruit IO connected" : "Adafruit IO offline");
-  aioUp = aioNow;
-  if (aioUp) io.run(0, true);
-
   static unsigned long lastRead = 0;
   if (millis() - lastRead >= 1000) { lastRead = millis(); readSensors(); }
 
@@ -369,21 +349,4 @@ void loop() {
     }
   }
 
-  if (millis() - lastPublish >= PUBLISH_MS) {
-    lastPublish = millis();
-    if (aioUp) {
-      if (!isnan(tempC))    fTemp->save(tempC);
-      if (!isnan(humidity)) fHum->save(humidity);
-      fLux->save(lux);
-      if (!isnan(presHpa))  fPres->save(presHpa);
-      fUv->save((int)uvRaw);
-      if (co2 > 0)          fCo2->save(co2);
-      if (pmFresh) {
-        fPm1->save(lastPm.pm10_standard);    // PM1.0
-        fPm25->save(lastPm.pm25_standard);   // PM2.5
-        fPm10->save(lastPm.pm100_standard);  // PM10
-      }
-      Serial.printf("Published to Adafruit IO: %.2fC %.2f%% %.1flx %.2fhPa uv=%u co2=%u\n", tempC, humidity, lux, presHpa, uvRaw, co2);
-    }
-  }
 }
