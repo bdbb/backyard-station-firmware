@@ -14,6 +14,7 @@
 #include <time.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 
 WebServer web(80);
 
@@ -27,6 +28,31 @@ unsigned long lastEnviPublish = 0;
 volatile uint32_t windPulses = 0, rainTips = 0;
 volatile unsigned long lastWindUs = 0, lastRainMs = 0;
 uint32_t gustPulses = 0; unsigned long gustWindowStart = 0; float gustKmh = 0, windKmh = 0;
+
+// rain today: from local midnight, kept in flash across restarts
+#define LOCAL_TZ "PST8PDT,M3.2.0,M11.1.0"   // US Pacific with daylight saving
+Preferences prefs;
+int rainDayKey = -1;
+uint32_t rainCarry = 0, rainBase = 0;
+uint32_t rainTodayTips() { noInterrupts(); uint32_t t = rainTips; interrupts(); return rainCarry + (t - rainBase); }
+
+void updateRainDay() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return;      // clock not synced yet
+  struct tm lt; localtime_r(&now, &lt);
+  int key = (lt.tm_year + 1900) * 10000 + (lt.tm_mon + 1) * 100 + lt.tm_mday;
+  if (key != rainDayKey) {
+    noInterrupts(); uint32_t t = rainTips; interrupts();
+    if (rainDayKey == -1 && prefs.getInt("day", 0) == key) { rainCarry = prefs.getUInt("tips", 0); rainBase = 0; }
+    else if (rainDayKey == -1) { rainCarry = 0; rainBase = 0; }
+    else { rainCarry = 0; rainBase = t; }
+    rainDayKey = key;
+    prefs.putInt("day", key); prefs.putUInt("tips", rainTodayTips());
+  }
+  static uint32_t saved = 0; static unsigned long lastSave = 0;
+  uint32_t today = rainTodayTips();
+  if (today != saved && millis() - lastSave > 60000) { prefs.putUInt("tips", today); saved = today; lastSave = millis(); }
+}
 
 void IRAM_ATTR onWindPulse() {
   unsigned long now = micros();
@@ -126,7 +152,7 @@ const $=i=>document.getElementById(i),N=300,H={wk:[]},S={},st=$('st'),g=$('g'),a
 const UV=[0,11,'linear-gradient(90deg,var(--g),var(--y) 27%,var(--o) 55%,var(--r) 73%,var(--p))'],
 PM=[0,75,'linear-gradient(90deg,var(--g) 0 12%,var(--y) 12% 47%,var(--o) 47% 74%,var(--r) 74%)'],
 CO=[400,2000,'linear-gradient(90deg,var(--g) 0 25%,var(--y) 25% 50%,var(--o) 50% 69%,var(--r) 69%)'];
-const M=[['t','Temperature',' °C',1,1],['h','Humidity',' %',0,2],['pm25','Air quality · PM2.5',' µg/m³',0,5,PM],['co2','CO₂',' ppm',0,50,CO],['gust','Gust · 5 min max',' km/h',1,2],['rain','Rain since restart',' mm',1,1],['uv','UV index','',1,.5,UV],['lux','Light',' lux',0,20],['p','Pressure',' hPa',1,1]];
+const M=[['t','Temperature',' °C',1,1],['h','Humidity',' %',0,2],['pm25','Air quality · PM2.5',' µg/m³',0,5,PM],['co2','CO₂',' ppm',0,50,CO],['gust','Gust · 5 min max',' km/h',1,2],['rain','Rain today',' mm',1,1],['uv','UV index','',1,.5,UV],['lux','Light',' lux',0,20],['p','Pressure',' hPa',1,1]];
 const RT={pm25:[[9,'Good'],[35.4,'Moderate'],[55.4,'Unhealthy for sensitive groups'],[125.4,'Unhealthy'],[1e9,'Very unhealthy']],uv:[[2.5,'Low'],[5.5,'Moderate'],[7.5,'High'],[10.5,'Very high'],[1e9,'Extreme']],co2:[[800,'Fresh'],[1200,'Moderate'],[1500,'Stuffy'],[1e9,'Poor']]};
 for(const[k,l,u,,,sc]of M){H[k]=[];g.insertAdjacentHTML('beforeend',`<div class=c id=c_${k}><div class=k>${l}<span class=rt id=r_${k}></span></div><div class=v><span id=v_${k}>–</span><span class=u>${u}</span></div>${sc?`<div class=bar style="background:${sc[2]}"><i id=b_${k} hidden></i></div>`:''}<svg class=sp viewBox="0 0 100 36" preserveAspectRatio="none"><polyline id="s_${k}"></polyline></svg><div class=x id=x_${k}></div></div>`)}
 const PT=['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'],pt=d=>PT[Math.round(d/22.5)%16];
@@ -177,7 +203,7 @@ void handleData() {
   o += jnum(out + o, sizeof(out) - o, "pm25", pmFresh ? lastPm.pm25_standard : NAN, 0);
   o += jnum(out + o, sizeof(out) - o, "wk", windKmh, 1);
   o += jnum(out + o, sizeof(out) - o, "wd", wd < 0 ? NAN : wd, 1);
-  o += jnum(out + o, sizeof(out) - o, "rain", tips * 0.2794, 2);
+  o += jnum(out + o, sizeof(out) - o, "rain", rainTodayTips() * 0.2794, 2);
   out[o - 1] = '}';
   web.send(200, "application/json", out);
 }
@@ -233,6 +259,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_RAIN), onRainTip, FALLING);
   analogSetPinAttenuation(PIN_VANE, ADC_11db);
   gustWindowStart = millis();
+  prefs.begin("rainday");
 }
 
 void publishToEnvi() {
@@ -249,12 +276,12 @@ void publishToEnvi() {
   o += jnum(fields + o, sizeof(fields) - o, "pressure_hpa", presHpa, 2, true);
   snprintf(fields + o, sizeof(fields) - o,
     "\"uv_index\":%.2f,\"co2_ppm\":%u,\"pm1\":%u,\"pm25\":%u,\"pm10\":%u,"
-    "\"wind_kmh\":%.1f,\"wind_gust_kmh\":%.1f,\"wind_dir_deg\":%.1f,\"rain_tips\":%u,\"rain_mm\":%.2f}",
+    "\"wind_kmh\":%.1f,\"wind_gust_kmh\":%.1f,\"wind_dir_deg\":%.1f,\"rain_tips\":%u,\"rain_mm\":%.2f,\"rain_today_mm\":%.2f}",
     uvRaw / 96.0, co2,
     pmFresh ? lastPm.pm10_standard : 0,
     pmFresh ? lastPm.pm25_standard : 0,
     pmFresh ? lastPm.pm100_standard : 0,
-    windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794);
+    windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794, rainTodayTips() * 0.2794);
   Serial.println(fields);
   char body[640];
   snprintf(body, sizeof(body),
@@ -295,7 +322,7 @@ void loop() {
       ArduinoOTA.begin();
       // core bug: first DNS lookup races SNTP and crashes, so look up once before starting the clock
       IPAddress ip; WiFi.hostByName(ENVI_HOST, ip);
-      configTime(0, 0, "pool.ntp.org", "time.google.com");
+      configTzTime(LOCAL_TZ, "pool.ntp.org", "time.google.com");
     }
     Serial.print("Wi-Fi up. Live page: http://"); Serial.println(WiFi.localIP());
   }
@@ -312,7 +339,7 @@ void loop() {
   }
 
   static unsigned long lastRead = 0;
-  if (millis() - lastRead >= 1000) { lastRead = millis(); readSensors(); }
+  if (millis() - lastRead >= 1000) { lastRead = millis(); readSensors(); updateRainDay(); }
 
   PM25_AQI_Data d;
   if (havePm && aqi.read(&d)) {
