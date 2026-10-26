@@ -222,8 +222,8 @@ void setup() {
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);       // don't stall when no serial monitor is open
   delay(2000);
-  Wire.begin(4, 5);
-  Wire1.begin(10, 11);    // bus 2: light + UV
+  Wire.begin(4, 5);       // bus 0: SCD41 first, its lamp pulses need the shortest power path
+  Wire1.begin(10, 11);    // bus 1: light + UV
 
   haveSht = sht.begin(0x44);
   bool haveLux = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire1);
@@ -232,6 +232,11 @@ void setup() {
     bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
     bmp.performReading();   // first reading after config is garbage
+    Wire.beginTransmission(0x77); Wire.write(0x00); Wire.endTransmission(false);
+    if (Wire.requestFrom((uint16_t)0x77, (uint8_t)1) == 1) {
+      uint8_t id = Wire.read();
+      Serial.printf("Pressure chip ID 0x%02X = %s\n", id, id == 0x50 ? "BMP388" : id == 0x60 ? "BMP390" : "unknown");
+    }
   }
   haveLtr = ltr.begin(&Wire1);
   if (haveLtr) {
@@ -249,7 +254,7 @@ void setup() {
   scd4x.stopPeriodicMeasurement();
   delay(500);
   haveScd = (scd4x.startPeriodicMeasurement() == 0);
-  Serial.printf("Sensors: sht=%d bmp=%d scd=%d | bus 2: light=%d uv=%d\n", haveSht, haveBmp, haveScd, haveLux, haveLtr);
+  Serial.printf("Sensors: sht=%d bmp=%d scd=%d | bus 1: light=%d uv=%d\n", haveSht, haveBmp, haveScd, haveLux, haveLtr);
 
   WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
     Serial.printf("Wi-Fi disconnected: %s\n", WiFi.STA.disconnectReasonName((wifi_err_reason_t)info.wifi_sta_disconnected.reason));
@@ -277,20 +282,26 @@ void publishToEnvi() {
 
   noInterrupts(); uint32_t rainTotal = rainTips; interrupts();
 
-  // leave out missing readings: nan isn't valid JSON
+  // missing readings are left out, never sent as 0
+  // rain stays a running total since boot, envi depends on it
+  float wd = readWindDir();
   char fields[480]; fields[0] = '{'; int o = 1;
   o += jnum(fields + o, sizeof(fields) - o, "tempC", tempC, 2, true);
   o += jnum(fields + o, sizeof(fields) - o, "humidity", humidity, 2, true);
-  o += jnum(fields + o, sizeof(fields) - o, "lux", lux, 1, true);
+  o += jnum(fields + o, sizeof(fields) - o, "lux", lux < 0 ? NAN : lux, 1, true);
   o += jnum(fields + o, sizeof(fields) - o, "pressure_hpa", presHpa, 2, true);
-  snprintf(fields + o, sizeof(fields) - o,
-    "\"uv_index\":%.2f,\"co2_ppm\":%u,\"pm1\":%u,\"pm25\":%u,\"pm10\":%u,"
-    "\"wind_kmh\":%.1f,\"wind_gust_kmh\":%.1f,\"wind_dir_deg\":%.1f,\"rain_tips\":%u,\"rain_mm\":%.2f,\"rain_today_mm\":%.2f}",
-    uvRaw / 96.0, co2,
-    pmFresh ? lastPm.pm10_standard : 0,
-    pmFresh ? lastPm.pm25_standard : 0,
-    pmFresh ? lastPm.pm100_standard : 0,
-    windKmh, gustKmh, readWindDir(), rainTotal, rainTotal * 0.2794, rainTodayTips() * 0.2794);
+  o += jnum(fields + o, sizeof(fields) - o, "uv_index", uvSeen ? uvRaw / 96.0 : NAN, 2, true);
+  o += jnum(fields + o, sizeof(fields) - o, "co2_ppm", co2 ? co2 : NAN, 0, true);
+  o += jnum(fields + o, sizeof(fields) - o, "pm1", pmFresh ? lastPm.pm10_standard : NAN, 0, true);
+  o += jnum(fields + o, sizeof(fields) - o, "pm25", pmFresh ? lastPm.pm25_standard : NAN, 0, true);
+  o += jnum(fields + o, sizeof(fields) - o, "pm10", pmFresh ? lastPm.pm100_standard : NAN, 0, true);
+  o += jnum(fields + o, sizeof(fields) - o, "wind_kmh", windKmh, 1, true);
+  o += jnum(fields + o, sizeof(fields) - o, "wind_gust_kmh", gustKmh, 1, true);
+  o += jnum(fields + o, sizeof(fields) - o, "wind_dir_deg", wd < 0 ? NAN : wd, 1, true);
+  o += jnum(fields + o, sizeof(fields) - o, "rain_tips", rainTotal, 0, true);
+  o += jnum(fields + o, sizeof(fields) - o, "rain_mm", rainTotal * 0.2794, 2, true);
+  o += jnum(fields + o, sizeof(fields) - o, "rain_today_mm", rainDayKey == -1 ? NAN : rainTodayTips() * 0.2794, 2, true);
+  if (o > 1) fields[o - 1] = '}'; else { fields[1] = '}'; fields[2] = 0; }
   Serial.println(fields);
   char body[640];
   snprintf(body, sizeof(body),
